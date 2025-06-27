@@ -3,8 +3,6 @@ import pandas as pd
 import io
 import zipfile
 import os
-import html5lib
-import beautifulsoup4
 from tempfile import TemporaryDirectory
 
 st.set_page_config(page_title="XLS to XLSX Converter", layout="centered")
