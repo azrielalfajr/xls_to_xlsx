@@ -1,7 +1,7 @@
 streamlit
 pandas
 openpyxl
-xlrd
+xlrd==1.2.0
 lxml
 html5lib
 beautifulsoup4
