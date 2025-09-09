@@ -3,12 +3,12 @@ import pandas as pd
 import io
 import zipfile
 import os
+import numpy as np
 from io import StringIO
 from tempfile import TemporaryDirectory
+from email import message_from_bytes
+from email.policy import default as email_default_policy
 
-# -----------------------------
-# App setup
-# -----------------------------
 st.set_page_config(page_title="XLS to XLSX Converter", layout="centered")
 st.title("📄 Konversi XLS ke XLSX dan Download ZIP")
 st.write(
@@ -19,101 +19,124 @@ st.write(
 
 uploaded_files = st.file_uploader("Upload file .xls", type=["xls"], accept_multiple_files=True)
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def is_probably_html(content_bytes: bytes) -> bool:
-    """
-    Banyak file .xls dari sistem legacy sebenarnya HTML yang bisa dibuka Excel.
-    Deteksi tanda-tanda HTML agar dibaca via pandas.read_html.
-    """
-    head = content_bytes[:4096].lower()
-    return (
-        b"<html" in head
-        or b"<!doctype html" in head
-        or b"<table" in head
-    )
+# -------- Helpers --------
+def is_probably_html(content: bytes) -> bool:
+    head = content[:4096].lower()
+    return (b"<html" in head) or (b"<!doctype html" in head) or (b"<table" in head)
 
-def try_read_html_to_df(content_bytes: bytes):
-    """
-    Baca konten HTML dan kembalikan DataFrame pertama.
-    """
-    text = content_bytes.decode("utf-8", errors="ignore")
-    dfs = pd.read_html(StringIO(text))  # butuh lxml/bs4/html5lib
+def is_probably_mhtml(content: bytes) -> bool:
+    head = content[:4096]
+    # Ciri umum file Internet Explorer "Save as Web Archive" atau export dari aplikasi
+    return head.startswith(b"MIME-Version:") or b"multipart/related" in head[:2048].lower()
+
+def extract_html_from_mhtml(content: bytes) -> str:
+    """Ambil bagian text/html terbesar dari berkas MHTML."""
+    msg = message_from_bytes(content, policy=email_default_policy)
+    html_parts = []
+
+    def walk(m):
+        if m.is_multipart():
+            for part in m.iter_parts():
+                walk(part)
+        else:
+            if m.get_content_type() == "text/html":
+                try:
+                    html_parts.append(m.get_content())
+                except Exception:
+                    pass
+
+    walk(msg)
+    if not html_parts:
+        raise ValueError("Tidak menemukan bagian text/html di MHTML.")
+    # Ambil yang paling besar (biasanya tabel utama)
+    return max(html_parts, key=len)
+
+def read_html_table(html_text: str) -> pd.DataFrame:
+    dfs = pd.read_html(StringIO(html_text))
     if not dfs:
-        return None, "Tidak ditemukan tabel dalam file HTML."
-    return dfs[0], None
+        raise ValueError("Tidak ditemukan <table> pada HTML.")
+    return dfs[0]
 
-def try_read_xls_to_df(content_bytes: bytes, skiprows=8):
-    """
-    Baca .xls biner menggunakan xlrd (perlu xlrd==1.2.0).
-    Return DF pertama (atau DF sheet pertama).
-    """
-    # Jika multi-sheet dan kamu ingin sheet tertentu, bisa tambahkan sheet_name=
-    df = pd.read_excel(io.BytesIO(content_bytes), engine="xlrd", skiprows=skiprows)
-    return df
-
-def clean_df_after_skip(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pembersihan ringan pasca skip baris:
-    - Reset index
-    - Drop kolom kosong total
-    """
+def clean_after_skip(df: pd.DataFrame) -> pd.DataFrame:
+    # Ganti string kosong jadi NaN agar mudah dibuang
+    df = df.replace("", np.nan)
+    df = df.dropna(how="all").dropna(axis=1, how="all")
     df = df.reset_index(drop=True)
-    df = df.dropna(axis=1, how="all")
     return df
 
 def convert_to_dataframe(uploaded_file):
     """
-    Core converter:
-    1) Baca bytes
-    2) Jika terdeteksi HTML -> read_html
-       else -> coba read_excel (xlrd)
-    3) Hapus 8 baris pertama (untuk HTML manual, untuk Excel via skiprows)
-    4) Bersihkan DF
+    Strategi:
+      - Jika MHTML: ekstrak HTML → read_html → skip 8 baris manual
+      - else jika HTML polos: read_html → skip 8 baris manual
+      - else: coba XLS biner (xlrd==1.2.0) dengan skiprows=8
+      - fallback silang kalau deteksi awal keliru
     """
     content = uploaded_file.read()
     uploaded_file.seek(0)
 
-    # Coba HTML dulu jika file "beraroma" HTML
-    if is_probably_html(content):
+    # 1) MHTML?
+    if is_probably_mhtml(content):
         try:
-            df, err = try_read_html_to_df(content)
-            if err:
-                return None, err
-            # Hapus 8 baris pertama secara manual (karena read_html tidak punya skiprows)
+            html_text = extract_html_from_mhtml(content)
+            df = read_html_table(html_text)
             df = df.iloc[8:] if len(df) > 8 else df.iloc[0:0]
-            df = clean_df_after_skip(df)
+            df = clean_after_skip(df)
             return df, None
-        except Exception as e_html:
-            # Jika HTML gagal, coba paksa sebagai Excel
+        except Exception as e:
+            # fallback ke Excel atau HTML polos
+            mhtml_err = e
+
+            # Coba Excel biner
             try:
-                df = try_read_xls_to_df(content, skiprows=8)
-                df = clean_df_after_skip(df)
+                df = pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=8)
+                df = clean_after_skip(df)
                 return df, None
             except Exception as e_xls:
-                return None, f"Tidak bisa baca sebagai HTML maupun XLS. HTML err: {e_html}; XLS err: {e_xls}"
+                # Coba HTML polos
+                try:
+                    text = content.decode("utf-8", errors="ignore")
+                    df = read_html_table(text)
+                    df = df.iloc[8:] if len(df) > 8 else df.iloc[0:0]
+                    df = clean_after_skip(df)
+                    return df, None
+                except Exception as e_html:
+                    return None, f"Gagal baca MHTML/Excel/HTML. MHTML: {mhtml_err}; Excel: {e_xls}; HTML: {e_html}"
 
-    # Jika tidak terdeteksi HTML, coba sebagai XLS
-    try:
-        df = try_read_xls_to_df(content, skiprows=8)
-        df = clean_df_after_skip(df)
-        return df, None
-    except Exception as e_xls:
-        # Fallback terakhir: coba HTML (kadang header HTML tidak muncul di 4KB awal)
+    # 2) HTML polos?
+    if is_probably_html(content):
         try:
-            df, err = try_read_html_to_df(content)
-            if err:
-                return None, err
+            text = content.decode("utf-8", errors="ignore")
+            df = read_html_table(text)
             df = df.iloc[8:] if len(df) > 8 else df.iloc[0:0]
-            df = clean_df_after_skip(df)
+            df = clean_after_skip(df)
             return df, None
         except Exception as e_html:
-            return None, f"Tidak bisa baca file sebagai XLS maupun HTML. XLS err: {e_xls}; HTML err: {e_html}"
+            # fallback Excel
+            try:
+                df = pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=8)
+                df = clean_after_skip(df)
+                return df, None
+            except Exception as e_xls:
+                return None, f"Gagal baca HTML maupun Excel. HTML: {e_html}; Excel: {e_xls}"
 
-# -----------------------------
-# Main action
-# -----------------------------
+    # 3) Asumsikan XLS biner
+    try:
+        df = pd.read_excel(io.BytesIO(content), engine="xlrd", skiprows=8)
+        df = clean_after_skip(df)
+        return df, None
+    except Exception as e_xls:
+        # fallback terakhir: coba treat sebagai HTML (kadang signature tidak tampak di awal)
+        try:
+            text = content.decode("utf-8", errors="ignore")
+            df = read_html_table(text)
+            df = df.iloc[8:] if len(df) > 8 else df.iloc[0:0]
+            df = clean_after_skip(df)
+            return df, None
+        except Exception as e_html:
+            return None, f"Tidak bisa baca file sebagai XLS maupun HTML. XLS: {e_xls}; HTML: {e_html}"
+
+# -------- Main --------
 if uploaded_files:
     if st.button("🔄 Konversi dan Download ZIP"):
         with TemporaryDirectory() as tmpdir:
@@ -129,19 +152,17 @@ if uploaded_files:
                         st.error(f"❌ {uploaded_file.name}: {error}")
                         continue
 
-                    # Buat nama file baru
                     new_filename = os.path.splitext(uploaded_file.name)[0] + ".xlsx"
                     output_path = os.path.join(tmpdir, new_filename)
 
                     try:
-                        df.to_excel(output_path, index=False, engine='openpyxl')
+                        df.to_excel(output_path, index=False, engine="openpyxl")
                         zipf.write(output_path, arcname=new_filename)
                         success_count += 1
                         st.success(f"✅ Berhasil: {new_filename}")
                     except Exception as e:
                         st.error(f"❌ Gagal menyimpan {new_filename}: {e}")
 
-            # Jika ada minimal satu file berhasil, tampilkan tombol unduh
             if success_count > 0:
                 zip_buffer.seek(0)
                 st.download_button(
